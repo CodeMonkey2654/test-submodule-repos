@@ -1,0 +1,113 @@
+services:
+  influxdb:
+    image: influxdb:2.7
+    container_name: influxdb
+    ports:
+      - "8086:8086"
+    environment:
+      INFLUXDB_ADMIN_USER: admin
+      INFLUXDB_ADMIN_PASSWORD: password
+      INFLUXDB_ORG: Milwaukee School of Engineering
+      INFLUXDB_BUCKET: RobotTest1
+      INFLUXDB_TOKEN: IspFSiWs4Y6diIscAuiteI4YzdVANIARTDkVc-uxRSbyJE9rIRz3DM2CTsq7QFEQ_f_EpyQMK6twqa7DiXJN7g==
+      INFLUXDB_HTTP_AUTH_ENABLED: "true"
+    volumes:
+      - ./influxdb_data:/var/lib/influxdb2
+    restart: unless-stopped
+  telegraf:
+    container_name: telegraf
+    image: telegraf:1.25
+    volumes:
+      - ./telegraf.conf:/etc/telegraf/telegraf.conf
+    environment:
+      INFLUXDB_ORG: Milwaukee School of Engineering
+      INFLUXDB_BUCKET: RobotTest1
+      INFLUXDB_TOKEN: IspFSiWs4Y6diIscAuiteI4YzdVANIARTDkVc-uxRSbyJE9rIRz3DM2CTsq7QFEQ_f_EpyQMK6twqa7DiXJN7g==
+    depends_on:
+      - influxdb
+    restart: unless-stopped
+  postgres:
+    image: postgres:15
+    container_name: postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres_user
+      POSTGRES_PASSWORD: postgres_password
+      POSTGRES_DB: postgres_db
+    volumes:
+      - ./postgres_data:/var/lib/postgresql/data
+    restart: unless-stopped
+  pgadmin:
+    image: dpage/pgadmin4
+    container_name: pgadmin
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@example.com
+      PGADMIN_DEFAULT_PASSWORD: admin_password
+    ports:
+      - "8080:80"
+    volumes:
+      - ./pgadmin_data:/var/lib/pgadmin
+    restart: unless-stopped
+
+  frontend:
+    container_name: frontend
+    build:
+      context: ../services/frontend
+      dockerfile: Dockerfile
+    ports:
+      - "3000:4173"
+    depends_on:
+      - postgres
+    restart: unless-stopped
+  backend:
+    container_name: backend
+    build:
+      context: ../services/backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    restart: unless-stopped
+    depends_on:
+      - postgres
+  websocket:
+    container_name: websocket
+    build:
+      context: ../services/websocket
+      dockerfile: Dockerfile
+    ports:
+      - "9001:9001"
+    restart: unless-stopped
+  jetson-simulator:
+    container_name: jetson-simulator
+    build:
+      context: ../services/jetson-simulator
+      dockerfile: Dockerfile
+    environment:
+      - ROS_MASTER_URI=http://localhost:11311
+      - ROS_IP=192.168.1.100
+      - ROS_HOSTNAME=jetson-simulator
+      - TZ=America/Chicago
+    ports:
+      - "8001:8001"
+    restart: unless-stopped
+
+volumes:
+  influxdb_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./influxdb_data  # Separate directory for InfluxDB data
+  postgres_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./postgres_data  # Separate directory for PostgreSQL data
+  pgadmin_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./pgadmin_data
