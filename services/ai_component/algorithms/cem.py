@@ -1,20 +1,23 @@
 import torch
 import torch.optim as optim
-from algorithms.networks import BasePolicyNetwork
+from algorithms.networks import CategoricalPolicy, GaussianPolicy
 from algorithms.base import BaseAlgorithm
 import numpy as np
 import gymnasium as gym
-
 
 class CEM(BaseAlgorithm):
     def setup(self):
         state_dim = self.env.observation_space.shape[0]
         if isinstance(self.env.action_space, gym.spaces.Discrete):
             action_dim = self.env.action_space.n
+            self.policy = CategoricalPolicy(state_dim, action_dim).to(self.device)
+            self.discrete = True
         else:
             action_dim = self.env.action_space.shape[0]
+            action_limit = self.env.action_space.high[0]
+            self.policy = GaussianPolicy(state_dim, action_dim, action_limit=action_limit).to(self.device)
+            self.discrete = False
 
-        self.policy = BasePolicyNetwork(state_dim, action_dim).to(self.device)
         self.optimizer = optim.Adam(self.policy.parameters(), lr=self.config['policy_lr'])
 
         self.num_iterations = self.config.get('num_iterations', 10)
@@ -27,14 +30,15 @@ class CEM(BaseAlgorithm):
         self.param_mean = self.get_flat_params().clone()
         self.param_std = torch.ones_like(self.param_mean) * self.config.get('initial_std', 0.1)
 
-    def select_action(self, state, evaluate=False):
+    def select_action(self, state):
         state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            mean, std = self.policy(state)
-            if evaluate:
-                action = mean.cpu().numpy()[0]
+            if self.discrete:
+                dist = self.policy(state)
+                action = dist.sample().item()
             else:
-                action = torch.normal(mean, std).cpu().numpy()[0]
+                mean, _ = self.policy(state)
+                action = mean.cpu().numpy()[0]
         return action
 
     def train_step(self):
@@ -72,13 +76,15 @@ class CEM(BaseAlgorithm):
         """
         total_rewards = []
         for _ in range(episodes):
-            state = self.env.reset()
+            state, _ = self.env.reset()
             done = False
             episode_reward = 0.0
             while not done:
-                action = self.select_action(state, evaluate=True)
-                state, reward, done, _ = self.env.step(action)
+                action = self.select_action(state)
+                next_state, reward, terminated, truncated, _ = self.env.step(action)
+                done = terminated or truncated
                 episode_reward += reward
+                state = next_state
             total_rewards.append(episode_reward)
         average_reward = np.mean(total_rewards)
         return average_reward

@@ -1,135 +1,142 @@
 import torch
-import torch.optim as optim
 import torch.nn.functional as F
+from torch.optim import Adam
 from algorithms.networks import GaussianPolicy, QNetwork
 from utils.replay_buffer import ReplayBuffer
 from algorithms.base import BaseAlgorithm
-import gymnasium as gym
+import numpy as np
 
 class TD3(BaseAlgorithm):
     def setup(self):
-        state_dim = self.env.observation_space.shape[0]
-        if isinstance(self.env.action_space, gym.spaces.Discrete):
-            action_dim = self.env.action_space.n
-            action_limit = None
-        else:
-            action_dim = self.env.action_space.shape[0]
-            action_limit = self.env.action_space.high[0]
+        # Environment dimensions
+        self.state_dim = self.env.observation_space.shape[0]
+        self.action_dim = self.env.action_space.shape[0]
+        self.max_action = float(self.env.action_space.high[0])
 
-        self.policy = GaussianPolicy(state_dim, action_dim, action_limit=action_limit).to(self.device)
-        self.q1 = QNetwork(state_dim, action_dim).to(self.device)
-        self.q2 = QNetwork(state_dim, action_dim).to(self.device)
-        self.q1_target = QNetwork(state_dim, action_dim).to(self.device)
-        self.q2_target = QNetwork(state_dim, action_dim).to(self.device)
-        self.q1_target.load_state_dict(self.q1.state_dict())
-        self.q2_target.load_state_dict(self.q2.state_dict())
-
-        self.policy_optimizer = optim.Adam(self.policy.parameters(), lr=self.config['policy_lr'])
-        self.q1_optimizer = optim.Adam(self.q1.parameters(), lr=self.config['q_lr'])
-        self.q2_optimizer = optim.Adam(self.q2.parameters(), lr=self.config['q_lr'])
-
-        self.replay_buffer = ReplayBuffer(self.config['buffer_size'], state_dim, action_dim)
-
+        # Hyperparameters
         self.gamma = self.config.get('gamma', 0.99)
         self.tau = self.config.get('tau', 0.005)
-        self.alpha = self.config.get('alpha', 0.2)
-        self.policy_delay = self.config.get('policy_delay', 2)
+        self.policy_noise = self.config.get('policy_noise', 0.2)
+        self.noise_clip = self.config.get('noise_clip', 0.5)
+        self.policy_freq = self.config.get('policy_freq', 2)
+        self.lr = self.config.get('lr', 3e-4)
+        self.buffer_size = self.config.get('buffer_size', 1000000)
+        self.batch_size = self.config.get('batch_size', 256)
+        self.hidden_size = self.config.get('hidden_size', 256)
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        # Initialize actor (policy) network
+        self.actor = GaussianPolicy(self.state_dim, self.action_dim, self.hidden_size, self.max_action).to(self.device)
+        self.actor_target = GaussianPolicy(self.state_dim, self.action_dim, self.hidden_size, self.max_action).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())
+        self.actor_optimizer = Adam(self.actor.parameters(), lr=self.lr)
+
+        # Initialize critic (Q-value) networks
+        self.critic1 = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic2 = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic1_target = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic2_target = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
+        self.critic1_optimizer = Adam(self.critic1.parameters(), lr=self.lr)
+        self.critic2_optimizer = Adam(self.critic2.parameters(), lr=self.lr)
+
+        # Initialize replay buffer
+        self.replay_buffer = ReplayBuffer(self.buffer_size, self.state_dim, self.action_dim)
+
         self.total_it = 0
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device)
+        state = torch.FloatTensor(state.reshape(1, -1)).to(self.device)
         if evaluate:
-            with torch.no_grad():
-                mean, std = self.policy(state)
-                action = torch.tanh(mean) * self.policy.action_limit
-            return action.cpu().numpy()
+            action, _, _ = self.actor.sample(state)
         else:
-            action, _ = self.policy.sample(state)
-            return action.cpu().numpy()
+            action, _, _ = self.actor.sample(state)
+            action = action + torch.randn_like(action) * self.policy_noise
+            action = action.clamp(-self.max_action, self.max_action)
+        return action.cpu().data.numpy().flatten()
 
     def train_step(self):
         self.total_it += 1
 
-        if self.replay_buffer.size < self.config['batch_size']:
-            return  # Not enough samples
+        # Sample from replay buffer
+        state, action, reward, next_state, done = self.replay_buffer.sample(self.batch_size)
 
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.config['batch_size'])
+        state = torch.FloatTensor(state).to(self.device)
+        action = torch.FloatTensor(action).to(self.device)
+        reward = torch.FloatTensor(reward).to(self.device).unsqueeze(1)
+        next_state = torch.FloatTensor(next_state).to(self.device)
+        done = torch.FloatTensor(done).to(self.device).unsqueeze(1)
 
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
-
-        # Select action according to policy and add clipped noise
         with torch.no_grad():
-            next_action, _ = self.policy.sample(next_states)
-            noise = (torch.randn_like(next_action) * 0.2).clamp(-0.5, 0.5)
-            next_action = (next_action + noise).clamp(-self.policy.action_limit, self.policy.action_limit)
+            # Select action according to policy and add clipped noise
+            noise = (torch.randn_like(action) * self.policy_noise).clamp(-self.noise_clip, self.noise_clip)
+            next_action, _, _ = self.actor_target.sample(next_state)
+            next_action = (next_action + noise).clamp(-self.max_action, self.max_action)
 
-            # Compute target Q-values
-            target_q1 = self.q1_target(next_states, next_action)
-            target_q2 = self.q2_target(next_states, next_action)
-            target_q = torch.min(target_q1, target_q2) - self.alpha * _  # Adjusted for entropy
-            target_q = rewards + (1 - dones) * self.gamma * target_q
+            # Compute the target Q value
+            target_Q1, _ = self.critic1_target(next_state, next_action)
+            target_Q2, _ = self.critic2_target(next_state, next_action)
+            target_Q = torch.min(target_Q1, target_Q2)
+            target_Q = reward + (1 - done) * self.gamma * target_Q
 
-        # Current Q estimates
-        current_q1 = self.q1(states, actions)
-        current_q2 = self.q2(states, actions)
+        # Get current Q estimates
+        current_Q1, _ = self.critic1(state, action)
+        current_Q2, _ = self.critic2(state, action)
 
-        # Compute Q loss
-        loss_q1 = F.mse_loss(current_q1, target_q)
-        loss_q2 = F.mse_loss(current_q2, target_q)
+        # Compute critic loss
+        critic_loss = F.mse_loss(current_Q1, target_Q) + F.mse_loss(current_Q2, target_Q)
 
-        # Optimize Q networks
-        self.q1_optimizer.zero_grad()
-        loss_q1.backward()
-        self.q1_optimizer.step()
-
-        self.q2_optimizer.zero_grad()
-        loss_q2.backward()
-        self.q2_optimizer.step()
+        # Optimize the critic
+        self.critic1_optimizer.zero_grad()
+        self.critic2_optimizer.zero_grad()
+        critic_loss.backward()
+        self.critic1_optimizer.step()
+        self.critic2_optimizer.step()
 
         # Delayed policy updates
-        if self.total_it % self.policy_delay == 0:
-            # Compute policy loss
-            actions_new, log_probs_new = self.policy.sample(states)
-            q1_new = self.q1(states, actions_new)
-            q2_new = self.q2(states, actions_new)
-            q_new = torch.min(q1_new, q2_new)
-            policy_loss = (self.alpha * log_probs_new - q_new).mean()
+        if self.total_it % self.policy_freq == 0:
+            # Compute actor loss
+            actor_loss = -self.critic1(state, self.actor(state)[0])[0].mean()
 
-            # Optimize policy
-            self.policy_optimizer.zero_grad()
-            policy_loss.backward()
-            self.policy_optimizer.step()
+            # Optimize the actor
+            self.actor_optimizer.zero_grad()
+            actor_loss.backward()
+            self.actor_optimizer.step()
 
-            # Soft update target networks
-            for target_param, param in zip(self.q1_target.parameters(), self.q1.parameters()):
+            # Update the frozen target models
+            for param, target_param in zip(self.critic1.parameters(), self.critic1_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-            for target_param, param in zip(self.q2_target.parameters(), self.q2.parameters()):
+            for param, target_param in zip(self.critic2.parameters(), self.critic2_target.parameters()):
                 target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def save(self, filepath):
-        torch.save({
-            'policy_state_dict': self.policy.state_dict(),
-            'q1_state_dict': self.q1.state_dict(),
-            'q2_state_dict': self.q2.state_dict(),
-            'q1_target_state_dict': self.q1_target.state_dict(),
-            'q2_target_state_dict': self.q2_target.state_dict(),
-            'policy_optimizer_state_dict': self.policy_optimizer.state_dict(),
-            'q1_optimizer_state_dict': self.q1_optimizer.state_dict(),
-            'q2_optimizer_state_dict': self.q2_optimizer.state_dict(),
-        }, filepath)
+            for param, target_param in zip(self.actor.parameters(), self.actor_target.parameters()):
+                target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-    def load(self, filepath):
-        checkpoint = torch.load(filepath)
-        self.policy.load_state_dict(checkpoint['policy_state_dict'])
-        self.q1.load_state_dict(checkpoint['q1_state_dict'])
-        self.q2.load_state_dict(checkpoint['q2_state_dict'])
-        self.q1_target.load_state_dict(checkpoint['q1_target_state_dict'])
-        self.q2_target.load_state_dict(checkpoint['q2_target_state_dict'])
-        self.policy_optimizer.load_state_dict(checkpoint['policy_optimizer_state_dict'])
-        self.q1_optimizer.load_state_dict(checkpoint['q1_optimizer_state_dict'])
-        self.q2_optimizer.load_state_dict(checkpoint['q2_optimizer_state_dict'])
+    def save(self, filename):
+        torch.save(self.critic1.state_dict(), filename + "_critic1")
+        torch.save(self.critic1_optimizer.state_dict(), filename + "_critic1_optimizer")
+        
+        torch.save(self.critic2.state_dict(), filename + "_critic2")
+        torch.save(self.critic2_optimizer.state_dict(), filename + "_critic2_optimizer")
+        
+        torch.save(self.actor.state_dict(), filename + "_actor")
+        torch.save(self.actor_optimizer.state_dict(), filename + "_actor_optimizer")
+
+    def load(self, filename):
+        self.critic1.load_state_dict(torch.load(filename + "_critic1"))
+        self.critic1_optimizer.load_state_dict(torch.load(filename + "_critic1_optimizer"))
+        self.critic1_target = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic1_target.load_state_dict(self.critic1.state_dict())
+
+        self.critic2.load_state_dict(torch.load(filename + "_critic2"))
+        self.critic2_optimizer.load_state_dict(torch.load(filename + "_critic2_optimizer"))
+        self.critic2_target = QNetwork(self.state_dim, self.action_dim, self.hidden_size).to(self.device)
+        self.critic2_target.load_state_dict(self.critic2.state_dict())
+
+        self.actor.load_state_dict(torch.load(filename + "_actor"))
+        self.actor_optimizer.load_state_dict(torch.load(filename + "_actor_optimizer"))
+        self.actor_target = GaussianPolicy(self.state_dim, self.action_dim, self.hidden_size, self.max_action).to(self.device)
+        self.actor_target.load_state_dict(self.actor.state_dict())

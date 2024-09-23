@@ -3,10 +3,9 @@ from .a3c import A3C
 from .cem import CEM
 from .ddpg import DDPG
 from .dqn import DQN
-from .evolutionary_strategies import EvolutionStrategies
+from .evolutionary_strategies import EvolutionaryStrategies
 from .i2a import I2A
 from .ppo import PPO
-from .q_learning import QLearning
 from .reinforce import REINFORCE
 from .sac import SAC
 from .sarsa import SARSA
@@ -22,10 +21,9 @@ __all__ = [
     'CEM',
     'DDPG',
     'DQN',
-    'EvolutionStrategies',
+    'EvolutionaryStrategies',
     'I2A',
     'PPO',
-    'QLearning',
     'REINFORCE',
     'SAC',
     'SARSA',

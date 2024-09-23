@@ -1,0 +1,6 @@
+policy_lr: 0.001
+buffer_size: 100000
+gamma: 0.99
+tau: 0.95
+batch_size: 256
+entropy_coeff: 0.001

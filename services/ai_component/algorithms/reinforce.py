@@ -1,8 +1,6 @@
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
-from torch.distributions import Categorical
-from algorithms.networks import PolicyNetwork
+from algorithms.networks import CategoricalPolicy
 from utils.replay_buffer import RolloutBuffer
 from algorithms.base import BaseAlgorithm
 import gymnasium as gym
@@ -12,50 +10,58 @@ class REINFORCE(BaseAlgorithm):
         state_dim = self.env.observation_space.shape[0]
         if isinstance(self.env.action_space, gym.spaces.Discrete):
             action_dim = self.env.action_space.n
-            discrete = True
+            self.discrete = True
         else:
             action_dim = self.env.action_space.shape[0]
-            discrete = False
+            self.discrete = False
 
-        self.policy = PolicyNetwork(state_dim, action_dim).to(self.device)
-        self.optimizer = optim.Adam(self.policy.parameters(), lr=self.config['policy_lr'])
+        hidden_sizes = self.config.get('hidden_sizes', (256, 256))
+        self.policy = CategoricalPolicy(state_dim, action_dim, hidden_sizes=hidden_sizes).to(self.device)
+        self.optimizer = optim.Adam(self.policy.parameters(), lr=self.config['learning_rate'])
 
-        self.rollout_buffer = RolloutBuffer(self.config['buffer_size'], state_dim, action_dim, discrete=discrete)
+        self.rollout_buffer = RolloutBuffer(self.config['buffer_size'], state_dim, action_dim, discrete=self.discrete)
 
         self.gamma = self.config.get('gamma', 0.99)
-        self.batch_size = self.config.get('batch_size', 256)
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device)
-        logits = self.policy(state)
-        if evaluate:
-            action = torch.argmax(logits).item()
-        else:
-            dist = F.softmax(logits, dim=-1)
-            dist = Categorical(dist)
-            action = dist.sample().item()
-        return action
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
+        with torch.no_grad():
+            dist = self.policy(state)
+            if evaluate:
+                action = dist.probs.argmax(dim=-1)
+            else:
+                action = dist.sample()
+        return action.cpu().numpy().squeeze()
 
     def train_step(self):
-        if self.rollout_buffer.size < self.batch_size:
-            return  # Not enough samples
-
-        states, actions, rewards, _, _, _, returns = self.rollout_buffer.sample(self.batch_size)
+        states, actions, rewards, _, dones, _ = self.rollout_buffer.sample()
 
         states = torch.FloatTensor(states).to(self.device)
         actions = torch.LongTensor(actions).to(self.device)
+
+        # Calculate returns
+        returns = []
+        G = 0
+        for reward, done in zip(reversed(rewards), reversed(dones)):
+            G = reward + self.gamma * G * (1 - done)
+            returns.insert(0, G)
         returns = torch.FloatTensor(returns).to(self.device)
 
-        logits = self.policy(states)
-        dist = F.softmax(logits, dim=-1)
-        dist = Categorical(dist)
+        # Normalize returns
+        returns = (returns - returns.mean()) / (returns.std() + 1e-8)
 
+        # Calculate loss
+        dist = self.policy(states)
         log_probs = dist.log_prob(actions)
         loss = -(log_probs * returns).mean()
 
+        # Optimize the policy
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
+
+        # Clear the rollout buffer
+        self.rollout_buffer.clear()
 
     def save(self, filepath):
         torch.save({

@@ -1,78 +1,83 @@
 import torch
 import torch.optim as optim
 import torch.nn.functional as F
-from algorithms.networks import SoftQNetwork
+from algorithms.networks import QNetwork
 from utils.replay_buffer import ReplayBuffer
 from algorithms.base import BaseAlgorithm
-from torch.distributions import Normal
+import numpy as np
 import gymnasium as gym
-
 
 class SoftQLearning(BaseAlgorithm):
     def setup(self):
         state_dim = self.env.observation_space.shape[0]
         if isinstance(self.env.action_space, gym.spaces.Discrete):
-            action_dim = self.env.action_space.n
+            self.action_dim = self.env.action_space.n
+            self.discrete = True
         else:
-            action_dim = self.env.action_space.shape[0]
+            self.action_dim = self.env.action_space.shape[0]
+            self.discrete = False
 
-        self.q_network = SoftQNetwork(state_dim, action_dim).to(self.device)
-        self.target_q_network = SoftQNetwork(state_dim, action_dim).to(self.device)
+        hidden_sizes = self.config.get('hidden_sizes', (256, 256))
+        self.q_network = QNetwork(state_dim, self.action_dim, hidden_sizes).to(self.device)
+        self.target_q_network = QNetwork(state_dim, self.action_dim, hidden_sizes).to(self.device)
         self.target_q_network.load_state_dict(self.q_network.state_dict())
 
-        self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.config['q_lr'])
+        self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.config['learning_rate'])
 
-        self.replay_buffer = ReplayBuffer(self.config['buffer_size'], state_dim, action_dim)
+        self.replay_buffer = ReplayBuffer(self.config['buffer_size'], state_dim, self.action_dim)
 
         self.gamma = self.config.get('gamma', 0.99)
-        self.tau = self.config.get('tau', 0.005)  # For soft updates
-        self.alpha = self.config.get('alpha', 0.2)
+        self.tau = self.config.get('tau', 0.005)
+        self.alpha = self.config.get('alpha', 0.2)  # Temperature parameter
         self.batch_size = self.config.get('batch_size', 256)
 
     def select_action(self, state, evaluate=False):
-        state = torch.FloatTensor(state).to(self.device)
+        state = torch.FloatTensor(state).unsqueeze(0).to(self.device)
         with torch.no_grad():
-            # Sample action from a Gaussian policy
-            mean = torch.zeros(self.env.action_space.shape[0]).to(self.device)
-            std = torch.ones(self.env.action_space.shape[0]).to(self.device)
-            dist = Normal(mean, std)
-            action = dist.sample().clamp(-1, 1) if not evaluate else torch.tanh(mean)
-        return action.cpu().numpy()
+            q_values = self.q_network(state, torch.zeros(1, self.action_dim).to(self.device))[0]
+            if self.discrete:
+                if evaluate:
+                    return q_values.argmax().item()
+                else:
+                    probs = F.softmax(q_values / self.alpha, dim=-1)
+                    return np.random.choice(self.action_dim, p=probs.cpu().numpy())
+            else:
+                if evaluate:
+                    return q_values.cpu().numpy()
+                else:
+                    return np.random.normal(q_values.cpu().numpy(), self.alpha)
 
     def train_step(self):
-        if self.replay_buffer.size < self.batch_size:
-            return  # Not enough samples
+        if len(self.replay_buffer) < self.batch_size:
+            return
 
-        states, actions, rewards, next_states, dones = self.replay_buffer.sample(self.batch_size)
+        state_batch, action_batch, reward_batch, next_state_batch, done_batch = self.replay_buffer.sample(self.batch_size)
 
-        states = torch.FloatTensor(states).to(self.device)
-        actions = torch.FloatTensor(actions).to(self.device)
-        rewards = torch.FloatTensor(rewards).unsqueeze(1).to(self.device)
-        next_states = torch.FloatTensor(next_states).to(self.device)
-        dones = torch.FloatTensor(dones).unsqueeze(1).to(self.device)
+        state_batch = torch.FloatTensor(state_batch).to(self.device)
+        next_state_batch = torch.FloatTensor(next_state_batch).to(self.device)
+        action_batch = torch.FloatTensor(action_batch).to(self.device)
+        reward_batch = torch.FloatTensor(reward_batch).unsqueeze(1).to(self.device)
+        done_batch = torch.FloatTensor(done_batch).unsqueeze(1).to(self.device)
 
-        # Current Q estimates
-        current_q = self.q_network(states, actions)
-
-        # Next actions and log probabilities
         with torch.no_grad():
-            mean = torch.zeros_like(next_states)
-            std = torch.ones_like(next_states)
-            dist = Normal(mean, std)
-            next_actions = dist.sample().clamp(-1, 1)
-            log_prob = dist.log_prob(next_actions).sum(dim=-1, keepdim=True)
-            target_q = self.target_q_network(next_states, next_actions) - self.alpha * log_prob
-            target_q = rewards + (1 - dones) * self.gamma * target_q
+            next_q1, next_q2 = self.target_q_network(next_state_batch, torch.zeros_like(action_batch))
+            next_q = torch.min(next_q1, next_q2)
+            if self.discrete:
+                next_v = self.alpha * torch.log(torch.sum(torch.exp(next_q / self.alpha), dim=1, keepdim=True))
+            else:
+                next_v = next_q - self.alpha * torch.log(2 * np.pi * self.alpha) - 0.5
+            target_q = reward_batch + (1 - done_batch) * self.gamma * next_v
 
-        # Loss
-        loss = F.mse_loss(current_q, target_q)
+        current_q1, current_q2 = self.q_network(state_batch, action_batch)
+        q1_loss = F.mse_loss(current_q1, target_q)
+        q2_loss = F.mse_loss(current_q2, target_q)
+        q_loss = q1_loss + q2_loss
 
-        # Optimize
         self.optimizer.zero_grad()
-        loss.backward()
+        q_loss.backward()
         self.optimizer.step()
 
-        # Soft update target network
+        # Soft update of the target network
         for target_param, param in zip(self.target_q_network.parameters(), self.q_network.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 

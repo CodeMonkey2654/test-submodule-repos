@@ -3,319 +3,295 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 def weights_init_(m):
+    """
+    Initialize network weights using Xavier uniform initialization.
+    
+    Args:
+        m (nn.Module): Module to initialize
+    """
     if isinstance(m, nn.Linear):
         torch.nn.init.xavier_uniform_(m.weight, gain=1)
         torch.nn.init.constant_(m.bias, 0)
 
 # ============================
-# Base Classes (Optional)
+# Base Classes
 # ============================
 
-class BasePolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256)):
+class BaseNetwork(nn.Module):
+    """
+    Base class for all neural networks.
+    """
+    def __init__(self):
+        super(BaseNetwork, self).__init__()
+    
+    def save(self, path):
+        """
+        Save the model parameters.
+        
+        Args:
+            path (str): Path to save the model
+        """
+        torch.save(self.state_dict(), path)
+    
+    def load(self, path):
+        """
+        Load the model parameters.
+        
+        Args:
+            path (str): Path to load the model from
+        """
+        self.load_state_dict(torch.load(path))
+
+class BasePolicyNetwork(BaseNetwork):
+    """
+    Base class for policy networks.
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=256):
         super(BasePolicyNetwork, self).__init__()
         layers = []
         input_dim = state_dim
-        for hidden_size in hidden_sizes:
+        for _ in range(3):  # Repeat hidden size 3 times
             layers.append(nn.Linear(input_dim, hidden_size))
             layers.append(nn.ReLU())
             input_dim = hidden_size
+        output_dim = action_dim
         self.model = nn.Sequential(*layers)
+        self.apply(weights_init_)
 
-class BaseValueNetwork(nn.Module):
-    def __init__(self, state_dim, hidden_sizes=(256, 256)):
+class BaseValueNetwork(BaseNetwork):
+    """
+    Base class for value networks.
+    """
+    def __init__(self, state_dim, hidden_size=256):
         super(BaseValueNetwork, self).__init__()
         layers = []
         input_dim = state_dim
-        for hidden_size in hidden_sizes:
+        for _ in range(3):  # Repeat hidden size 3 times
             layers.append(nn.Linear(input_dim, hidden_size))
             layers.append(nn.ReLU())
             input_dim = hidden_size
         layers.append(nn.Linear(input_dim, 1))  # Outputs a single scalar value
         self.model = nn.Sequential(*layers)
-
-
-class GaussianPolicy(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_size: int, action_limit: float = 1.0):
-        super(GaussianPolicy, self).__init__()
-        self.action_dim = action_dim
-        self.action_limit = action_limit
-
-        # Define the network layers
-        self.fc1 = nn.Linear(state_dim, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        
-        # Output layers for mean and log_std
-        self.mean_layer = nn.Linear(hidden_size, action_dim)
-        self.log_std_layer = nn.Linear(hidden_size, action_dim)
-
-        # Initialize weights
         self.apply(weights_init_)
 
-    def forward(self, state: torch.Tensor):
+# ============================
+# Policy Networks
+# ============================
+
+class CategoricalPolicy(BasePolicyNetwork):
+    """
+    Categorical policy network for discrete action spaces.
+    Used in: A2C, A3C, PPO, REINFORCE
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=256):
+        super(CategoricalPolicy, self).__init__(state_dim, action_dim, hidden_size)
+        self.action_head = nn.Linear(hidden_size, action_dim)
+    
+    def forward(self, state):
+        """
+        Forward pass to compute action probabilities.
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+        
+        Returns:
+            torch.distributions.Categorical: Categorical distribution over actions
+        """
+        x = self.model(state)
+        action_probs = F.softmax(self.action_head(x), dim=-1)
+        return torch.distributions.Categorical(action_probs)
+
+class GaussianPolicy(BasePolicyNetwork):
+    """
+    Gaussian policy network for continuous action spaces.
+    Used in: DDPG, SAC, PPO (continuous)
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=256, action_limit=1.0):
+        super(GaussianPolicy, self).__init__(state_dim, action_dim, hidden_size)
+        self.mean_head = nn.Linear(hidden_size, action_dim)
+        self.log_std_head = nn.Linear(hidden_size, action_dim)
+        self.action_limit = action_limit
+    
+    def forward(self, state):
         """
         Forward pass to compute mean and log_std of the Gaussian distribution.
-        """
-        x = F.relu(self.fc1(state))
-        x = F.relu(self.fc2(x))
         
-        mean = self.mean_layer(x)
-        log_std = self.log_std_layer(x)
-        log_std = torch.clamp(log_std, min=-20, max=2)  # To ensure numerical stability
-
+        Args:
+            state (torch.Tensor): Input state tensor
+        
+        Returns:
+            tuple: (mean, log_std) of the Gaussian distribution
+        """
+        x = self.model(state)
+        mean = self.mean_head(x)
+        log_std = self.log_std_head(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)
         return mean, log_std
-
-    def sample(self, state: torch.Tensor):
+    
+    def sample(self, state):
         """
         Sample an action using the reparameterization trick.
-        Returns action, log probability, and the sampled pre-tanh value.
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+        
+        Returns:
+            tuple: (action, log_prob, pre_tanh_value)
         """
         mean, log_std = self.forward(state)
         std = log_std.exp()
         normal = torch.distributions.Normal(mean, std)
-        z = normal.rsample()  # Reparameterization trick
-        action = torch.tanh(z) * self.action_limit
-        log_prob = normal.log_prob(z) - torch.log(self.action_limit * (1 - action.pow(2)) + 1e-6)
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
-        return action, log_prob, z
+        x_t = normal.rsample()
+        action = torch.tanh(x_t)
+        log_prob = normal.log_prob(x_t) - torch.log(1 - action.pow(2) + 1e-6)
+        return self.action_limit * action, log_prob.sum(1, keepdim=True), x_t
 
-    def sample_deterministic(self, state: torch.Tensor):
-        """
-        Select the deterministic action (mean of the Gaussian).
-        """
-        mean, _ = self.forward(state)
-        action = torch.tanh(mean) * self.action_limit
-        log_prob = torch.zeros(action.size(0), 1).to(state.device)  # Log prob is zero for deterministic
-        return action, log_prob, mean
+# ============================
+# Value Networks
+# ============================
 
-class QNetwork(nn.Module):
-    def __init__(self, state_dim: int, action_dim: int, hidden_size: int):
+class ValueNetwork(BaseValueNetwork):
+    """
+    Value network for estimating state values.
+    Used in: A2C, A3C, TRPO
+    """
+    def forward(self, state):
+        """
+        Forward pass to compute state value.
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+        
+        Returns:
+            torch.Tensor: Estimated state value
+        """
+        return self.model(state)
+
+class QNetwork(BaseNetwork):
+    """
+    Q-Network for estimating state-action values.
+    Used in: DQN, DDPG, SAC
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=512):
         super(QNetwork, self).__init__()
-        # Define the network layers
-        self.fc1 = nn.Linear(state_dim + action_dim, hidden_size)
-        self.fc2 = nn.Linear(hidden_size, hidden_size)
-        self.q_layer = nn.Linear(hidden_size, 1)
-
-        # Initialize weights
+        self.q1 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        self.q2 = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, 1)
+        )
+        self.dropout = nn.Dropout(0.1)
+        self.layer_norm = nn.LayerNorm(hidden_size)
         self.apply(weights_init_)
-
-    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
-        """
-        Forward pass to compute Q-value for a state-action pair.
-        """
-        x = torch.cat([state, action], dim=1)
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
-        q_value = self.q_layer(x)
-        return q_value
     
-class ValueNetwork(nn.Module):
-    def __init__(self, state_dim, hidden_sizes=(256, 256)):
-        super(ValueNetwork, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1)
-        )
-
-    def forward(self, state):
-        return self.model(state)
-    
-class PolicyNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256)):
-        super(PolicyNetwork, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], action_dim)
-        )
-
-    def forward(self, state):
-        return self.model(state)
-
-
-# ============================
-# Actor-Critic Networks
-# ============================
-
-class Actor(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), activation=nn.ReLU, output_activation=nn.Tanh):
-        super(Actor, self).__init__()
-        layers = []
-        input_dim = state_dim
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden_size))
-            layers.append(activation())
-            input_dim = hidden_size
-        layers.append(nn.Linear(input_dim, action_dim))
-        layers.append(output_activation())
-        self.model = nn.Sequential(*layers)
-
-    def forward(self, state):
-        return self.model(state)
-    
-class Critic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), activation=nn.ReLU):
-        super(Critic, self).__init__()
-        layers = []
-        input_dim = state_dim + action_dim
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden_size))
-            layers.append(activation())
-            input_dim = hidden_size
-        layers.append(nn.Linear(input_dim, 1))
-        self.model = nn.Sequential(*layers)
-
     def forward(self, state, action):
+        """
+        Forward pass to compute Q-values.
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+            action (torch.Tensor): Input action tensor
+        
+        Returns:
+            tuple: (Q1, Q2) estimated Q-values
+        """
         x = torch.cat([state, action], dim=-1)
-        return self.model(x)
-    
-class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, action_limit, hidden_sizes=(256, 256), activation=nn.ReLU):
-        super(ActorCritic, self).__init__()
-        self.shared_layers = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            activation(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            activation()
-        )
-        self.actor_head = nn.Sequential(
-            nn.Linear(hidden_sizes[1], action_dim),
-            nn.Tanh()
-        )
-        self.critic_head = nn.Linear(hidden_sizes[1], 1)
-        self.action_limit = action_limit
-
-    def forward(self, state):
-        shared_features = self.shared_layers(state)
-        action = self.actor_head(shared_features) * self.action_limit
-        value = self.critic_head(shared_features)
-        return action, value
-    
+        
+        # Q1 network
+        q1 = self.q1[:2](x)  # First two layers
+        q1 = self.layer_norm(q1)
+        q1 = self.dropout(q1)
+        q1 = self.q1[2:](q1)  # Remaining layers
+        
+        # Q2 network
+        q2 = self.q2[:2](x)  # First two layers
+        q2 = self.layer_norm(q2)
+        q2 = self.dropout(q2)
+        q2 = self.q2[2:](q2)  # Remaining layers
+        
+        return q1, q2
 
 # ============================
-# SoftQ Networks
+# Specialized Networks
 # ============================
 
-
-class SoftQNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256)):
-        super(SoftQNetwork, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1)
-        )
-
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.model(x)
-    
-    
-# ============================
-# TRPO Networks
-# ============================
-
-class TRPOPolicyNetwork(BasePolicyNetwork):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), discrete=False):
-        super(TRPOPolicyNetwork, self).__init__(state_dim, action_dim, hidden_sizes)
-        self.discrete = discrete
-        if self.discrete:
-            self.action_head = nn.Linear(hidden_sizes[-1], action_dim)
-        else:
-            self.mean_head = nn.Linear(hidden_sizes[-1], action_dim)
-            self.log_std_head = nn.Linear(hidden_sizes[-1], action_dim)
-
-    def forward(self, state):
-        x = self.model(state)
-        if self.discrete:
-            action_logits = self.action_head(x)
-            return action_logits
-        else:
-            mean = self.mean_head(x)
-            log_std = self.log_std_head(x)
-            log_std = torch.clamp(log_std, min=-20, max=2)  # Stability
-            std = torch.exp(log_std)
-            return mean, std
-
-class TRPOValueNetwork(BaseValueNetwork):
-    def __init__(self, state_dim, hidden_sizes=(256, 256)):
-        super(TRPOValueNetwork, self).__init__(state_dim, hidden_sizes)
-
-    def forward(self, state):
-        return self.model(state)
-
-# ============================
-# CEM Networks
-# ============================
-
-class CEMPolicyNetwork(BasePolicyNetwork):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(64, 64), discrete=False):
-        super(CEMPolicyNetwork, self).__init__(state_dim, action_dim, hidden_sizes)
-        self.discrete = discrete
-        if self.discrete:
-            self.action_head = nn.Linear(hidden_sizes[-1], action_dim)
-        else:
-            self.mean_head = nn.Linear(hidden_sizes[-1], action_dim)
-            self.log_std_head = nn.Linear(hidden_sizes[-1], action_dim)
-
-    def forward(self, state):
-        x = self.model(state)
-        if self.discrete:
-            action_logits = self.action_head(x)
-            return action_logits
-        else:
-            mean = self.mean_head(x)
-            log_std = self.log_std_head(x)
-            log_std = torch.clamp(log_std, min=-20, max=2)
-            std = torch.exp(log_std)
-            return mean, std
-
-# ============================
-# I2A Networks
-# ============================
-
-class I2AImaginationNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256)):
+class I2AImaginationNetwork(BaseNetwork):
+    """
+    Imagination network for I2A algorithm.
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=512):
         super(I2AImaginationNetwork, self).__init__()
-        layers = []
-        input_dim = state_dim + action_dim
-        for hidden_size in hidden_sizes:
-            layers.append(nn.Linear(input_dim, hidden_size))
-            layers.append(nn.ReLU())
-            input_dim = hidden_size
-        layers.append(nn.Linear(input_dim, state_dim))  # Predict next state
-        self.model = nn.Sequential(*layers)
-
+        self.model = nn.Sequential(
+            nn.Linear(state_dim + action_dim, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, hidden_size),
+            nn.ReLU(),
+            nn.Linear(hidden_size, state_dim)
+        )
+        self.apply(weights_init_)
+    
     def forward(self, state, action):
+        """
+        Forward pass to predict next state.
+        
+        Args:
+            state (torch.Tensor): Current state tensor
+            action (torch.Tensor): Action tensor
+        
+        Returns:
+            torch.Tensor: Predicted next state
+        """
         x = torch.cat([state, action], dim=-1)
-        next_state = self.model(x)
-        return next_state
+        return self.model(x)
+
+    def predict_n_steps(self, initial_state, actions, n_steps):
+        """
+        Predict state transitions for n steps.
+        
+        Args:
+            initial_state (torch.Tensor): Initial state tensor
+            actions (torch.Tensor): Sequence of action tensors
+            n_steps (int): Number of steps to predict
+        
+        Returns:
+            torch.Tensor: Predicted states for n steps
+        """
+        states = [initial_state]
+        for i in range(n_steps):
+            next_state = self.forward(states[-1], actions[i])
+            states.append(next_state)
+        return torch.stack(states[1:])  # Exclude initial state
 
 class I2APolicyNetwork(BasePolicyNetwork):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), discrete=False):
-        super(I2APolicyNetwork, self).__init__(state_dim, action_dim, hidden_sizes)
-        self.discrete = discrete
-        if self.discrete:
-            self.action_head = nn.Linear(hidden_sizes[-1], action_dim)
-        else:
-            self.mean_head = nn.Linear(hidden_sizes[-1], action_dim)
-            self.log_std_head = nn.Linear(hidden_sizes[-1], action_dim)
+    """
+    Policy network for I2A algorithm.
+    """
+    def __init__(self, state_dim, action_dim, hidden_size=512):
+        super(I2APolicyNetwork, self).__init__(state_dim, action_dim, hidden_size)
+        self.apply(weights_init_)
 
     def forward(self, state):
-        x = self.model(state)
-        if self.discrete:
-            action_logits = self.action_head(x)
-            return action_logits
-        else:
-            mean = self.mean_head(x)
-            log_std = self.log_std_head(x)
-            log_std = torch.clamp(log_std, min=-20, max=2)
-            std = torch.exp(log_std)
-            return mean, std
+        """
+        Forward pass to compute action probabilities.
+        
+        Args:
+            state (torch.Tensor): Input state tensor
+        
+        Returns:
+            torch.distributions.Categorical: Categorical distribution over actions
+        """
+        return self.model(state)
