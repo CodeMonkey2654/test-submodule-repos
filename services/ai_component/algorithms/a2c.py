@@ -15,12 +15,14 @@ class A2C(BaseAlgorithm):
         state_dim = self.env.observation_space.shape[0]
         if isinstance(self.env.action_space, gym.spaces.Discrete):
             action_dim = self.env.action_space.n
+            action_limit = None
             discrete = True
         else:
             action_dim = self.env.action_space.shape[0]
+            action_limit = self.env.action_space.high[0]
             discrete = False
 
-        self.actor_critic = ActorCritic(state_dim, action_dim).to(self.device)
+        self.actor_critic = ActorCritic(state_dim, action_dim, action_limit).to(self.device)
         self.optimizer = optim.Adam(self.actor_critic.parameters(), lr=self.config['policy_lr'])
 
         self.rollout_buffer = RolloutBuffer(self.config['buffer_size'], state_dim, action_dim, discrete=discrete)

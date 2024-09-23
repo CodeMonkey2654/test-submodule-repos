@@ -12,8 +12,12 @@ class DQN(BaseAlgorithm):
         state_dim = self.env.observation_space.shape[0]
         if isinstance(self.env.action_space, gym.spaces.Discrete):
             action_dim = self.env.action_space.n
+            action_limit = None
+            discrete = True
         else:
             action_dim = self.env.action_space.shape[0]
+            action_limit = self.env.action_space.high[0]
+            discrete = False
 
         self.q_network = QNetwork(state_dim, action_dim).to(self.device)
         self.target_q_network = QNetwork(state_dim, action_dim).to(self.device)
@@ -21,7 +25,7 @@ class DQN(BaseAlgorithm):
 
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.config['q_lr'])
 
-        self.replay_buffer = ReplayBuffer(self.config['buffer_size'], state_dim, action_dim, discrete=True)
+        self.replay_buffer = ReplayBuffer(self.config['buffer_size'], state_dim, action_dim, discrete=discrete)
 
         self.gamma = self.config.get('gamma', 0.99)
         self.tau = self.config.get('tau', 0.005)  # For soft updates

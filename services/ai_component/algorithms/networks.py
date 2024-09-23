@@ -2,6 +2,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+def weights_init_(m):
+    if isinstance(m, nn.Linear):
+        torch.nn.init.xavier_uniform_(m.weight, gain=1)
+        torch.nn.init.constant_(m.bias, 0)
+
 # ============================
 # Base Classes (Optional)
 # ============================
@@ -31,42 +36,78 @@ class BaseValueNetwork(nn.Module):
 
 
 class GaussianPolicy(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(512, 512)):
+    def __init__(self, state_dim: int, action_dim: int, hidden_size: int, action_limit: float = 1.0):
         super(GaussianPolicy, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(state_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], action_dim),
-            nn.Tanh()
-        )
+        self.action_dim = action_dim
+        self.action_limit = action_limit
 
-    def forward(self, state):
-        return self.model(state)
+        # Define the network layers
+        self.fc1 = nn.Linear(state_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        
+        # Output layers for mean and log_std
+        self.mean_layer = nn.Linear(hidden_size, action_dim)
+        self.log_std_layer = nn.Linear(hidden_size, action_dim)
+
+        # Initialize weights
+        self.apply(weights_init_)
+
+    def forward(self, state: torch.Tensor):
+        """
+        Forward pass to compute mean and log_std of the Gaussian distribution.
+        """
+        x = F.relu(self.fc1(state))
+        x = F.relu(self.fc2(x))
+        
+        mean = self.mean_layer(x)
+        log_std = self.log_std_layer(x)
+        log_std = torch.clamp(log_std, min=-20, max=2)  # To ensure numerical stability
+
+        return mean, log_std
+
+    def sample(self, state: torch.Tensor):
+        """
+        Sample an action using the reparameterization trick.
+        Returns action, log probability, and the sampled pre-tanh value.
+        """
+        mean, log_std = self.forward(state)
+        std = log_std.exp()
+        normal = torch.distributions.Normal(mean, std)
+        z = normal.rsample()  # Reparameterization trick
+        action = torch.tanh(z) * self.action_limit
+        log_prob = normal.log_prob(z) - torch.log(self.action_limit * (1 - action.pow(2)) + 1e-6)
+        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        return action, log_prob, z
+
+    def sample_deterministic(self, state: torch.Tensor):
+        """
+        Select the deterministic action (mean of the Gaussian).
+        """
+        mean, _ = self.forward(state)
+        action = torch.tanh(mean) * self.action_limit
+        log_prob = torch.zeros(action.size(0), 1).to(state.device)  # Log prob is zero for deterministic
+        return action, log_prob, mean
 
 class QNetwork(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(512, 512)):
+    def __init__(self, state_dim: int, action_dim: int, hidden_size: int):
         super(QNetwork, self).__init__()
-        self.model = nn.Sequential(
-            nn.Linear(state_dim + action_dim, hidden_sizes[0]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[0], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], hidden_sizes[1]),
-            nn.ReLU(),
-            nn.Linear(hidden_sizes[1], 1)
-        )
+        # Define the network layers
+        self.fc1 = nn.Linear(state_dim + action_dim, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, hidden_size)
+        self.q_layer = nn.Linear(hidden_size, 1)
 
-    def forward(self, state, action):
-        x = torch.cat([state, action], dim=-1)
-        return self.model(x)
+        # Initialize weights
+        self.apply(weights_init_)
+
+    def forward(self, state: torch.Tensor, action: torch.Tensor) -> torch.Tensor:
+        """
+        Forward pass to compute Q-value for a state-action pair.
+        """
+        x = torch.cat([state, action], dim=1)
+        x = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(x))
+        q_value = self.q_layer(x)
+        return q_value
     
 class ValueNetwork(nn.Module):
     def __init__(self, state_dim, hidden_sizes=(256, 256)):
@@ -134,7 +175,7 @@ class Critic(nn.Module):
         return self.model(x)
     
 class ActorCritic(nn.Module):
-    def __init__(self, state_dim, action_dim, hidden_sizes=(256, 256), activation=nn.ReLU):
+    def __init__(self, state_dim, action_dim, action_limit, hidden_sizes=(256, 256), activation=nn.ReLU):
         super(ActorCritic, self).__init__()
         self.shared_layers = nn.Sequential(
             nn.Linear(state_dim, hidden_sizes[0]),
@@ -147,10 +188,11 @@ class ActorCritic(nn.Module):
             nn.Tanh()
         )
         self.critic_head = nn.Linear(hidden_sizes[1], 1)
+        self.action_limit = action_limit
 
     def forward(self, state):
         shared_features = self.shared_layers(state)
-        action = self.actor_head(shared_features)
+        action = self.actor_head(shared_features) * self.action_limit
         value = self.critic_head(shared_features)
         return action, value
     

@@ -1,6 +1,5 @@
 import torch
 import torch.optim as optim
-import torch.nn.functional as F
 from algorithms.networks import BasePolicyNetwork
 from algorithms.base import BaseAlgorithm
 import numpy as np
