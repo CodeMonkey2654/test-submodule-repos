@@ -25,7 +25,6 @@ const ContactForm: React.FC = () => {
     setError(null);
     setLoading(true);
     try {
-      // Replace with actual API call
       await new Promise((resolve) => setTimeout(resolve, 1000));
       console.log('Form submitted:', formData);
       setSubmitted(true);
