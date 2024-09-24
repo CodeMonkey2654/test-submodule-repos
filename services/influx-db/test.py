@@ -4,7 +4,7 @@ from influxdb_client.client.write_api import SYNCHRONOUS
 from influxdb_client.client.query_api import QueryApi
 
 INFLUX_DB_URL = "http://localhost:8086"
-INFLUX_DB_TOKEN = "IspFSiWs4Y6diIscAuiteI4YzdVANIARTDkVc-uxRSbyJE9rIRz3DM2CTsq7QFEQ_f_EpyQMK6twqa7DiXJN7g=="
+INFLUX_DB_TOKEN = "XVQaux-L_QCdgnce7gCiSoxPW6VMt4SscAcBv4btrAar55dnXdRzZhBv6pZnqyFoua5JGqc1-evruGnYTGXaqQ=="
 INFLUX_DB_ORG = "Milwaukee School of Engineering"
 INFLUX_DB_BUCKET = "RobotTest1"
 

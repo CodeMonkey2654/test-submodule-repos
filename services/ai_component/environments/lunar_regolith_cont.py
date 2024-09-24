@@ -18,6 +18,7 @@ class LunarRegolithSimulationContinuous(gym.Env):
                  arena_width=10.0,
                  material_friction=1.0,
                  material_density=1.0,
+                 num_motors=12,
                  num_craters=5,
                  num_boulders=10,
                  goal_area_size=(1.0, 1.0, 0.5)):
@@ -66,7 +67,8 @@ class LunarRegolithSimulationContinuous(gym.Env):
         # Define action and observation spaces
         if self.action_type == 'continuous':
             # Example: continuous actions for joint torques
-            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.sim.model.nu,), dtype=np.float32)
+            self.num_motors = num_motors
+            self.action_space = spaces.Box(low=-1.0, high=1.0, shape=(self.num_motors,), dtype=np.float32)
         elif self.action_type == 'discrete':
             # Example: discrete actions (e.g., forward, backward, left, right, stop)
             self.action_space = spaces.Discrete(5)
